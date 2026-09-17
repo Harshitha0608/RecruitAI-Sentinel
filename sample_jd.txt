@@ -1,0 +1,22 @@
+Job Title: Senior Software Engineer
+Company: Sentinel Tech
+Location: Remote
+Employment Type: Full-Time
+Experience Required: 5+ years
+
+Role Overview:
+We are looking for a Senior Software Engineer with strong experience in React, TypeScript, Python, and FastAPI to build AI-powered candidate screening systems.
+
+Technical Requirements:
+- Python 3.11+
+- FastAPI
+- React & TypeScript
+- Docker & Kubernetes
+
+Preferred Skills:
+- Machine Learning / NLP
+- FAISS & Vector Search
+- Next.js
+
+Education:
+Bachelor's degree in Computer Science or related field.

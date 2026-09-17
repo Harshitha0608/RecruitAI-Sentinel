@@ -1,0 +1,100 @@
+# Python virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+
+# Next.js / Node.js
+node_modules/
+.next/
+out/
+build/
+dist/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Databases and Local indexes
+*.db
+*.sqlite
+*.faiss
+vectors/
+index/
+
+# Environment files
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# IDE / Editor config
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+
+# OS and Temp Files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.log
+temp/
+tmp/
+
+# Python artifacts
+*.pkl
+*.joblib
+
+# Uploaded datasets
+uploads/
+data/
+*.jsonl
+
+# Generated retrieval indexes
+backend/app/tfidf.pkl
+backend/app/candidate_ids.json
+backend/app/candidate_offsets.json
+
+# Local runtime files & state
+run_metrics.json
+submission_metadata.yaml.local
+submission.csv
+backend/app/active_job_description.txt
+backend/app/precompute_status.json
+backend/app/ranking_cache_meta.json
+backend/app/run_metrics.json
+backend/app/screening_progress.json
+backend/app/ranking_results.json
+
+# TypeScript build metadata
+frontend/tsconfig.tsbuildinfo
+
+# Temporary development & verification artifacts
+scratch/
+inspect_tfidf.py
+test_retrieval_direct.py
+read_transcript.py
+get_cand_data.py
+screenshot.py
+*.png
+.agents/
+
+# Coverage
+.coverage
+htmlcov/
+
+# macOS
+.DS_Store
