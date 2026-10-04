@@ -8,6 +8,21 @@ from backend.app.schemas.job_description import JobDescription
 
 logger = logging.getLogger("app.ranking.ranking_engine")
 
+# Flat frozenset of all lowercase skill tokens recognized by the project ONTOLOGY.
+# Lazily initialized via _get_ontology_flat_skills() to avoid circular import with backend.app.services.
+_ONTOLOGY_FLAT_SKILLS: Optional[frozenset] = None
+
+
+def _get_ontology_flat_skills() -> frozenset:
+    """Lazily loads and returns the flat frozenset of all ONTOLOGY skills."""
+    global _ONTOLOGY_FLAT_SKILLS
+    if _ONTOLOGY_FLAT_SKILLS is None:
+        from backend.app.services.jd_parser import ONTOLOGY
+        _ONTOLOGY_FLAT_SKILLS = frozenset(
+            skill for category_skills in ONTOLOGY.values() for skill in category_skills
+        )
+    return _ONTOLOGY_FLAT_SKILLS
+
 # Configurable relationship table for semantic matching (alphabetically sorted keys)
 SEMANTIC_SIMILARITY_MAP: Dict[Tuple[str, str], float] = {
     ("chromadb", "faiss"): 0.75,
@@ -305,7 +320,13 @@ class RankingEngine:
     }
 
     def _get_constituent_technical_skills(self, req_text: str, technical_skills: List[str]) -> List[str]:
-        """Finds concise atomic technical skills explicitly mentioned within a composite/prose requirement."""
+        """Finds concise atomic technical skills explicitly mentioned within a composite/prose requirement.
+
+        Used during the candidate evaluation loop (line 878) to match candidate skills
+        against composite JD requirement lines. This method retains the original
+        case-insensitive boundary matching so that candidate skills (which may be
+        stored in various cases) can still be recognized.
+        """
         if not req_text or not technical_skills:
             return []
         
@@ -331,6 +352,81 @@ class RankingEngine:
                 constituents.append(s_clean)
                 
         return constituents
+
+    @staticmethod
+    def _skill_in_text(skill_lower: str, text: str) -> bool:
+        """Returns True when the ONTOLOGY skill (lowercase) appears in *text* as a recognizable
+        technical term rather than an ordinary English word.
+
+        Matching rules (mirrors skill_intelligence_engine.is_text_match logic):
+        - For multi-word skills: plain case-insensitive substring (words are distinct enough).
+        - For single-token, purely alphabetic skills (e.g. 'go', 'react', 'rust'):
+          use case-INSENSITIVE word-boundary search, then verify the matched substring
+          in the original text is NOT all-lowercase. Capitalized ('Go', 'React') or
+          all-caps ('BERT', 'SQL') forms are treated as technical terms; all-lowercase
+          ('go', 'react') appearing in ordinary English prose are rejected.
+        - For skills that contain non-alphabetic characters (e.g. 'c++', 'c#', 'next.js',
+          'sentence-transformers', 'wav2vec2'): normalize punctuation (- _ /) to spaces
+          and use case-insensitive matching. These forms are unambiguous technical terms.
+        """
+        if not skill_lower or not text:
+            return False
+
+        # Multi-word skill: plain case-insensitive substring is safe (distinct enough)
+        if ' ' in skill_lower:
+            norm_text = re.sub(r'[-_/]', ' ', text.lower())
+            norm_skill = re.sub(r'[-_/]', ' ', skill_lower)
+            return norm_skill in norm_text
+
+        # Does the skill contain any non-alphabetic character (digit, +, #, ., /, -)?
+        is_purely_alpha = skill_lower.isalpha()
+
+        if is_purely_alpha:
+            # Case-INSENSITIVE word-boundary search to locate the token in original text,
+            # then inspect the actual matched substring: if it is all-lowercase in the
+            # original text it is treated as an ordinary English word and rejected.
+            # Capitalized ('Go', 'React') or all-caps ('BERT', 'SQL') forms are accepted.
+            pat = r'\b' + re.escape(skill_lower) + r'\b'
+            m = re.search(pat, text, re.IGNORECASE)
+            if m is None:
+                return False
+            matched_substr = m.group(0)
+            # Reject if the matched text is purely lowercase (English verb/noun)
+            return not matched_substr.islower()
+        else:
+            # Skill has punctuation/digits: normalize and use case-insensitive search.
+            norm_skill = re.sub(r'[-_/]', ' ', skill_lower)
+            norm_text = re.sub(r'[-_/]', ' ', text.lower())
+            prefix = r'(?<![a-zA-Z0-9])'
+            suffix = r'(?![a-zA-Z0-9])'
+            pat = prefix + re.escape(norm_skill) + suffix
+            return bool(re.search(pat, norm_text))
+
+    @staticmethod
+    def _get_ontology_skills_in_text(req_text: str) -> List[str]:
+        """Scans a single requirement *line* for skills recognized by the project ONTOLOGY.
+
+        Unlike _get_constituent_technical_skills() (which uses jd.technical_skills as its
+        vocabulary), this method uses the module-level _ONTOLOGY_FLAT_SKILLS frozenset.
+        This guarantees two properties required for critical-skill selection:
+
+          1. Provenance safety: only the ONTOLOGY is the vocabulary source — not
+             jd.technical_skills, which aggregates both required AND preferred sections.
+          2. False-positive safety: uses case-sensitive matching for purely-alphabetic
+             skills (via _skill_in_text), so 'go'/'react' in ordinary English prose
+             do not match the programming language / framework.
+
+        Returns a list of matching ONTOLOGY skill strings (lowercase keys) in the order
+        they are found; deduplication and alphabetical sort are handled by the caller.
+        """
+        if not req_text:
+            return []
+        found: List[str] = []
+        ontology_skills = _get_ontology_flat_skills()
+        for skill in sorted(ontology_skills, key=len, reverse=True):
+            if RankingEngine._skill_in_text(skill, req_text):
+                found.append(skill)
+        return found
 
     def load_model(self) -> None:
         """Lazily loads SentenceTransformer embedding model."""
@@ -801,18 +897,63 @@ class RankingEngine:
         analysis = self.skill_engine.analyze(candidate, jd)
         skill_rarity_map = skill_rarity_map or {}
 
-        # Core required skills (first 2 requirements)
-        critical_reqs = jd.requirements[:2]
-        has_critical_1 = False
-        has_critical_2 = False
+        # --- Stable critical-skill selection (order-independent) ---
+        # Derive atomic technical skills that appear specifically in the REQUIRED requirement
+        # lines by scanning each prose requirement against the project ONTOLOGY (not against
+        # jd.technical_skills, which blends required AND preferred sections).
+        # This guarantees provenance safety: only skills from the ONTOLOGY that appear
+        # textually in jd.requirements lines can become critical candidates.
+        # Case-sensitive matching (via _get_ontology_skills_in_text) prevents English
+        # homographs ('go', 'react') from matching as technical skills in ordinary prose.
+        jd_tech_skills = getattr(jd, "technical_skills", None) or []  # still used in evaluation loop
+        required_atomic_skills: list = []
+        seen_atomic: set = set()
+        for req_line in jd.requirements:
+            for atomic_lower in self._get_ontology_skills_in_text(req_line):
+                if atomic_lower not in seen_atomic:
+                    seen_atomic.add(atomic_lower)
+                    required_atomic_skills.append(atomic_lower)
+        # Alphabetical sort: stable, deterministic, independent of prose-line ordering
+        required_atomic_skills.sort()
+
+        # Select up to 2 atomic critical skills from required lines only.
+        # Falls back to the original first-2-requirements prose slice when no atomic skills
+        # could be extracted (e.g. free-text-only JDs with no jd.technical_skills).
+        if required_atomic_skills:
+            critical_reqs = required_atomic_skills[:2]
+            critical_selection_mode = "atomic"
+        else:
+            critical_reqs = jd.requirements[:2]
+            critical_selection_mode = "prose_fallback"
+
+        # Track whether each critical skill has been matched for the mandatory-penalty gate
+        critical_reqs_matched: set = set()
 
         raw_skill_score = 0.0
         max_possible_raw_skill = 0.0
 
-        # Build list of skills with importance weights (FIX 5)
+        # Build list of skills with importance weights (FIX 5 — order-independent).
+        # In atomic mode a prose requirement line is critical when it contains at least
+        # one of the two selected critical atomic skills (content-based, not position-based).
+        # In prose-fallback mode the first two requirement lines remain critical as before.
+        _crit_lowers = {c.lower() for c in critical_reqs}
+
+        def _req_is_critical(req_text: str) -> bool:
+            if critical_selection_mode == "prose_fallback":
+                return False  # handled by idx below
+            # Use case-sensitive _skill_in_text so that e.g. 'go' in ordinary English
+            # prose does not trigger a match for the 'go' programming language critical skill.
+            for crit_l in _crit_lowers:
+                if RankingEngine._skill_in_text(crit_l, req_text):
+                    return True
+            return False
+
         skills_to_eval = []
         for idx, r in enumerate(jd.requirements):
-            is_crit = (idx < 2)
+            if critical_selection_mode == "prose_fallback":
+                is_crit = (idx < 2)
+            else:
+                is_crit = _req_is_critical(r)
             w = 1.0 if is_crit else 0.8
             skills_to_eval.append((r, w, is_crit))
         for p in jd.preferred_skills:
@@ -828,8 +969,8 @@ class RankingEngine:
             cls, reason, best_cand_skill = self.skill_evaluator.classify(req, candidate)
 
             # If conversational/prose requirement failed direct coverage, evaluate constituent atomic skills
-            if cls in ("NONE", "RELATED") and getattr(jd, "technical_skills", None):
-                constituents = self._get_constituent_technical_skills(req, jd.technical_skills)
+            if cls in ("NONE", "RELATED") and jd_tech_skills:
+                constituents = self._get_constituent_technical_skills(req, jd_tech_skills)
                 matched_constituents = []
                 for t_skill in constituents:
                     t_cls, t_reason, t_cand_skill = self.skill_evaluator.classify(t_skill, candidate)
@@ -848,6 +989,13 @@ class RankingEngine:
                     )
                     t_skill, cls, t_reason, best_cand_skill = best_match
                     reason = f"Matched via constituent skill '{t_skill}': {t_reason}"
+
+                    # When in atomic mode: if a matched constituent is one of the critical
+                    # atomic skills, record it as a critical match for the penalty gate.
+                    if critical_selection_mode == "atomic" and is_crit:
+                        if t_skill.lower() in {c.lower() for c in critical_reqs}:
+                            critical_reqs_matched.add(t_skill.lower())
+
                 elif cls == "NONE":
                     for t_skill in constituents:
                         t_cls, t_reason, t_cand_skill = self.skill_evaluator.classify(t_skill, candidate)
@@ -861,10 +1009,20 @@ class RankingEngine:
 
             if cls in ("DIRECT", "EQUIVALENT"):
                 if is_crit:
-                    if len(critical_reqs) > 0 and req == critical_reqs[0]:
-                        has_critical_1 = True
-                    elif len(critical_reqs) > 1 and req == critical_reqs[1]:
-                        has_critical_2 = True
+                    # Prose-fallback mode: track by identity match (original behaviour)
+                    if critical_selection_mode == "prose_fallback":
+                        if len(critical_reqs) > 0 and req == critical_reqs[0]:
+                            critical_reqs_matched.add(critical_reqs[0].lower())
+                        elif len(critical_reqs) > 1 and req == critical_reqs[1]:
+                            critical_reqs_matched.add(critical_reqs[1].lower())
+                    # Atomic mode: the direct classify hit is on a prose line, not an
+                    # atomic skill — no constituent upgrade occurred. Check if the prose
+                    # line itself references any critical atomic skill using the same
+                    # case-sensitive _skill_in_text logic used during selection.
+                    else:
+                        for crit_skill in critical_reqs:
+                            if RankingEngine._skill_in_text(crit_skill.lower(), req):
+                                critical_reqs_matched.add(crit_skill.lower())
                     critical_matched.append(req)
                 elif weight >= 0.8:
                     important_matched.append(req)
@@ -899,14 +1057,15 @@ class RankingEngine:
                     important_matched.append(req)
                 else:
                     matched_pref.append(req)
-            else: # RELATED or NONE
+            else:  # RELATED or NONE
                 if is_crit:
                     missing_critical.append(req)
                     raw_skill_score -= 3.0 * skill_rarity_map.get(req.lower().strip(), 1.0)
 
-        # JD Mandatory filter: Lacks BOTH of the top 2 critical skills
+        # JD Mandatory filter: candidate lacks BOTH of the critical skills.
+        # Penalty applies only when 2 critical skills were successfully identified.
         mandatory_penalty = 0.0
-        if len(critical_reqs) >= 2 and (not has_critical_1 and not has_critical_2):
+        if len(critical_reqs) >= 2 and len(critical_reqs_matched) == 0:
             mandatory_penalty = 20.0
 
         if max_possible_raw_skill > 0:
